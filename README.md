@@ -1,4 +1,4 @@
-# 42_cursus
+# 42 Madrid Common Core
 
 > My complete journey through the **42 Madrid Common Core**, organized by milestones.
 
