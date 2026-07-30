@@ -1,0 +1,1747 @@
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   webserv.cpp                                        :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: msoriano <msoriano@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2026/01/08 18:51:13 by angnavar          #+#    #+#             */
+/*   Updated: 2026/05/15 13:10:57 by msoriano         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+/*-----------------------------------------------------------------------
+ *                          🧠WEBSERV BRAIN🧠
+ *
+ * This class represents the main Webserver engine using epoll
+ *
+ * Responsibilities:
+ *  - Load and store parsed configuration
+ *  - Initialize listening sockets for each server
+ *  - Manage the main event loop (epoll)
+ *  - Handle client connections
+ * 	- Handle client requests
+ *  - Call to read and parse HTTP requests
+ *  - Route requests to the appropriate handler (static files / CGI)
+ *  - Execute CGI scripts asynchronously using pipes and call handler
+ *  - Send response back to client
+ *
+ * The run() method starts the infinite event loop
+ * where the server waits for incoming connections
+ * and processes client events.
+ * -----------------------------------------------------------------------
+ */
+
+#include "webserv.hpp"
+#include "configParser.hpp"
+#include "validation.hpp"
+#include "matchLocation.hpp"
+#include "utils.hpp"
+#include "logger.hpp"
+#include "httpResponse.hpp"
+#include "cgiHandler.hpp"
+#include "pathResolver.hpp"
+
+bool Webserv::_running = true; // Initialize the static running variable
+
+/* Returns number of pending bytes to be written to CGI stdin
+ * (writeBuffer - writeOffset)
+ */
+static size_t getCgiPendingBytes(const CgiContext* ctx)
+{
+    if (!ctx)
+        return 0;
+    if (ctx->writeBuffer.size() <= ctx->writeOffset)
+        return 0;
+    return ctx->writeBuffer.size() - ctx->writeOffset;
+}
+
+/* Incrementally parses chunked transfer encoding:
+ *  - Reads chunk size (hex)
+ *  - Extracts chunk data
+ *  - Validates CRLF separators
+ *  - Stops when final chunk (size 0) is reached
+ *
+ * Allows processing large bodies without buffering entire request.
+ */
+bool Webserv::parseChunkedIncremental(ClientState& client)
+{
+    if (!client.requestIsChunked)
+        return false;
+
+    if (!client.chunkParseInitialized)
+    {
+        client.chunkParseInitialized = true;
+        client.chunkParsePos = client.requestHeadersEnd + 4;
+        client.chunkCurrentSize = 0;
+        client.chunkParseState = 0;
+        client.chunkParseComplete = false;
+        client.chunkDecodedBody.clear();
+    }
+
+    while (true)
+    {
+        if (client.chunkParseState == 0)
+        {
+            size_t lineEnd = client.readBuffer.find("\r\n", client.chunkParsePos);
+            if (lineEnd == std::string::npos)
+                return false;
+
+            std::string sizeLine =
+                client.readBuffer.substr(client.chunkParsePos, lineEnd - client.chunkParsePos);
+            size_t semicolonPos = sizeLine.find(';');
+            if (semicolonPos != std::string::npos)
+                sizeLine.erase(semicolonPos);
+            if (sizeLine.empty())
+                throw std::runtime_error("Invalid chunk size");
+
+            std::stringstream ss;
+            size_t chunkSize = 0;
+            ss << std::hex << sizeLine;
+            ss >> chunkSize;
+            if (ss.fail())
+                throw std::runtime_error("Invalid chunk size");
+
+            client.chunkCurrentSize = chunkSize;
+            client.chunkParsePos = lineEnd + 2;
+            if (chunkSize == 0)
+                client.chunkParseState = 3;
+            else
+                client.chunkParseState = 1;
+        }
+        else if (client.chunkParseState == 1)
+        {
+            if (client.readBuffer.size() < client.chunkParsePos + client.chunkCurrentSize)
+                return false;
+
+            client.chunkDecodedBody.append(client.readBuffer, client.chunkParsePos,
+                                           client.chunkCurrentSize);
+            client.chunkParsePos += client.chunkCurrentSize;
+            client.chunkParseState = 2;
+        }
+        else if (client.chunkParseState == 2)
+        {
+            if (client.readBuffer.size() < client.chunkParsePos + 2)
+                return false;
+            if (client.readBuffer.compare(client.chunkParsePos, 2, "\r\n") != 0)
+                throw std::runtime_error("Missing CRLF after chunk data");
+
+            client.chunkParsePos += 2;
+            client.chunkParseState = 0;
+        }
+        else
+        {
+            if (client.readBuffer.size() < client.chunkParsePos + 2)
+                return false;
+            if (client.readBuffer.compare(client.chunkParsePos, 2, "\r\n") != 0)
+                throw std::runtime_error("Invalid final chunk ending");
+
+            client.chunkParsePos += 2;
+            client.chunkParseComplete = true;
+            return true;
+        }
+    }
+}
+
+/* Destroys a CGI execution context
+ * - Detaches context from client if still linked
+ * - Closes input/output pipes
+ * - Optionally kills CGI process (SIGKILL)
+ * - Reaps process using waitpid (non-blocking)
+ * - Frees memory
+ */
+void Webserv::destroyCgiContext(CgiContext* ctx, bool killProcess)
+{
+    if (!ctx)
+        return;
+
+    if (this->clients.count(ctx->clientFd))
+    {
+        ClientState& client = this->clients[ctx->clientFd];
+        if (client.cgiCtx == ctx)
+            detachCgiContext(client);
+    }
+
+    closeCgiPipe(ctx, ctx->inFd);
+    closeCgiPipe(ctx, ctx->outFd);
+
+    if (killProcess && ctx->pid > 0)
+        kill(ctx->pid, SIGKILL);
+
+    if (ctx->pid > 0)
+        waitpid(ctx->pid, NULL, WNOHANG);
+
+    delete ctx;
+}
+
+/* Detaches CGI context from client state
+ * - Resets streaming-related flags
+ * - Updates epoll interest accordingly
+ */
+void Webserv::detachCgiContext(ClientState& client)
+{
+    if (!client.cgiCtx)
+        return;
+
+    client.resetCgiStreamState();
+    syncClientEpollInterest(client);
+}
+
+/* Closes one CGI pipe (inFd or outFd)
+ * - Removes FD from epoll
+ * - Removes FD from internal CGI map
+ * - Closes file descriptor
+ * - Updates context state
+ */
+void Webserv::closeCgiPipe(CgiContext* ctx, int& pipeFd)
+{
+    if (!ctx || pipeFd == -1)
+        return;
+
+    int oldFd = pipeFd;
+    epoll_ctl(this->epollFd, EPOLL_CTL_DEL, oldFd, NULL);
+    _cgiFds.erase(oldFd);
+    close(oldFd);
+
+    if (ctx->inFd == oldFd)
+        ctx->inputRegistered = false;
+
+    pipeFd = -1;
+}
+
+/*
+ * - Receives path to conf at startup
+ * - Loads and parses using ConfigParser
+ * - Normalizes + validates
+ * - Stores the resulting configurations internally for later use
+ */
+Webserv::Webserv(const std::string& configFile)
+{
+    std::cout << BLUE << "Webserv initialized with config: " << RESET << configFile << std::endl;
+
+    // 1) Parse configuration
+    ConfigParser parser;
+    this->config = parser.parse(configFile);
+
+    // 2) Normalize + validate configuration
+    validateAllServers(this->config);
+}
+
+/*
+ * Creates and initializes the listening sockets defined in config
+ * - Creates listening sockets based on server blocks
+ * - Configures socket OPTIONS (SO_REUSEADDR, non-blocking mode, ...) and PORT
+ * - Adds listening sockets to poll()
+ * - Stores mapping between fd and server configuration
+ * */
+void Webserv::setSockets()
+{
+    // for each Config in this->config:
+    //     1. Create socket, set O_NONBLOCK, bind host:port, listen
+    //     2. Add to poll fd vector
+    //     3. Keep a map listeningFd -> serverIndex
+    epollFd = epoll_create1(0);
+    if (epollFd < 0)
+    {
+        std::cerr << RED << "Error epoll create: " << strerror(errno) << RESET << std::endl;
+    }
+
+    for (size_t i = 0; i < this->config.size(); ++i)
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+            continue;
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+
+        addrinfo hints, *res;
+        std::memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        if (getaddrinfo(config[i].host.c_str(), NULL, &hints, &res) != 0)
+        {
+            std::cerr << RED << "Error binding port " << config[i].port << " " << strerror(errno)
+                      << RESET << std::endl;
+            continue;
+        }
+
+        sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
+        addr->sin_port = htons(config[i].port);
+
+        if (bind(fd, res->ai_addr, res->ai_addrlen) < 0)
+        {
+            std::cerr << RED << "Error binding port " << config[i].port << ": " << strerror(errno)
+                      << RESET << std::endl;
+            freeaddrinfo(res);
+            close(fd);
+            continue;
+        }
+        freeaddrinfo(res);
+
+        if (listen(fd, 128) < 0)
+        {
+            std::cerr << RED << "Error listen fd: " << strerror(errno) << RESET << std::endl;
+            close(fd);
+            continue;
+        }
+
+        struct epoll_event ev;
+        std::memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+
+        if (epoll_ctl(epollFd, EPOLL_CTL_ADD, fd, &ev) < 0)
+        {
+            std::cerr << "Error epoll_ctl" << std::endl;
+            close(fd);
+            continue;
+        }
+
+        this->fdToConfig[fd] = this->config[i];
+        this->fds.push_back(fd);
+        std::cout << PURPLE << "Server [" << config[i].server_name << "] listening on port http://localhost:"
+                  << config[i].port << RESET << std::endl;
+    }
+}
+
+/*
+ * Checks whether a fd corresponds to one of the server listening sockets
+ */
+bool Webserv::isListeningFd(int fd)
+{
+    for (size_t i = 0; i < this->fds.size(); ++i)
+    {
+        if (this->fds[i] == fd)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * - Accepts a new client connection from a listening socket
+ * - Sets the client socket to non-blocking mode & registers
+ *    it in epoll instance for further monitoring
+ */
+void Webserv::acceptNewConnection(int listeningFd)
+{
+    sockaddr_in clientAddr;
+    socklen_t clientLen = sizeof(clientAddr);
+
+    int clientFd = accept(listeningFd, (struct sockaddr*)&clientAddr, &clientLen);
+    if (clientFd < 0)
+    {
+        std::cerr << "Error in accept: " << strerror(errno) << std::endl;
+        return;
+    }
+    fcntl(clientFd, F_SETFL, O_NONBLOCK);
+
+    ClientState newClient;
+    newClient.fd = clientFd;
+    newClient.config = this->fdToConfig[listeningFd];
+    newClient.writeBuffer = "";
+    this->clients[clientFd] = newClient;
+
+    epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.fd = clientFd;
+
+    if (epoll_ctl(this->epollFd, EPOLL_CTL_ADD, clientFd, &ev) < 0)
+    {
+        std::cerr << "Error adding client to epoll" << std::endl;
+        this->clients.erase(clientFd);
+        close(clientFd);
+        return;
+    }
+
+    logDebug(GREEN, "New connection accepted on FD: " + to_string(clientFd) +
+                        " for server: " + newClient.config.server_name);
+}
+
+/*
+ * Routes a parsed HTTP request accroding to server and location
+ * (router decides how sever must respond to a request)
+ * 	1. Matches request path  configured locations
+ *       If no matching location found -> returns 404
+ *  2. Handles redirections before any further processing
+ *  3. Checks wether HTTP method allowed
+ *  4. Rejects request if body exceeds client_max_body_size
+ *  5. Resolves request URI into a real path (FILESYSTEM)
+ *  6. Detects whether target must be executed as CGI
+ *    If the request IS  CGI:
+ *          a) builds the CGI target description
+ *          b) executes program
+ *          c) parses output into an HttpResponse
+ *    If the request IS NOT CGI:
+ *      	a) computes relative path inside matched location
+ *      	b) dispatches request to method handler
+ *  7. Returns a fully built HttpResponse object
+
+ */
+HttpResponse Webserv::routeRequest(const HttpRequest& req, const Config& server)
+{
+    HttpResponse res;
+    // -------------- DEBUG: ------------------
+    if (DEBUG)
+    {
+        std::string routeMsg = "[ROUTE] method=" + req.getMethod() + " path=" + req.getPath() +
+                               " body_size=" + to_string(req.getBody().size());
+        logDebug(CYAN, routeMsg);
+    }
+    // ----------------------------------------
+    // 1. Match location algorythm
+    const Location* loc = matchLocation(server, req.getPath());
+    // Steps 2, 3 & 4 moved from previous HttpResponse:
+    //   - Why? HttpResponse shouldnt be the one deciding if reqeust can or cannotr execute but only
+    //   handle reponse after core decides
+
+    // 2. If NO location        → 404
+    //	  	 redirection        → 302
+    if (!loc)
+    {
+        // -------------- DEBUG: ------------------
+        logDebug(RED, "[ROUTE] no matching location");
+        // ----------------------------------------
+
+        res.setErrorPage(404, server.error_pages, server.root);
+        return (res);
+    }
+    // ----------------------------------- DEBUG: ---------------------------------------
+    else
+    {
+        if (DEBUG)
+        {
+            std::string matchedMsg =
+                "[ROUTE] matched location path=" + loc->path +
+                " client_max_body_size=" + to_string(loc->client_max_body_size);
+            logDebug(GREEN, matchedMsg);
+        }
+    }
+    // ----------------------------------------------------------------------------------
+    if (!loc->redir.empty())
+    {
+        res.setRedirect(loc->redir, 302);
+        return (res);
+    }
+    // 4. Check allowed client_max_body_size
+    if (loc->client_max_body_size > 0 && req.getBody().length() > loc->client_max_body_size)
+    {
+        // ----------------------------------- DEBUG: ---------------------------------------
+        if (DEBUG)
+        {
+            std::string bodyLimitMsg = "[ROUTE] body size exceeds client_max_body_size limit=" +
+                                       to_string(loc->client_max_body_size) +
+                                       " actual=" + to_string(req.getBody().length());
+            logDebug(RED, bodyLimitMsg);
+        }
+        // ----------------------------------------------------------------------------------
+        res.setErrorPage(413, server.error_pages, server.root);
+        return (res);
+    }
+
+    // 5. Resolve real path (FILESYSTEM)
+    ResolvedPath resolved = resolvePath(*loc, req.getPath());
+    // ----------------------------------- DEBUG: --------------------------------
+    if (DEBUG)
+    {
+        std::string resolvedMsg = "[ROUTE] resolved path=" + resolved.fsPath;
+        logDebug(BLUE, resolvedMsg);
+    }
+    // ----------------------------------------------------------------------------
+
+    // 6. Check allowed methods.
+    // CGI gets priority so POST to .bla works even if the location is GET-only.
+    CgiTarget target;
+    if (isCgiRequest(*loc, resolved.fsPath))
+        target = _cgiHandler->detectCgi(*loc, resolved.fsPath);
+
+    if (!target.isCgi)
+    {
+        bool allowed = false;
+        for (size_t i = 0; i < loc->allow_methods.size(); ++i)
+        {
+            if (loc->allow_methods[i] == req.getMethod())
+            {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed)
+        {
+            // -------------- DEBUG: ------------------
+            logDebug(RED, "[ROUTE] returning 405");
+            // ----------------------------------------
+            res.setErrorPage(405, server.error_pages, server.root);
+            return (res);
+        }
+    }
+    else if (req.getMethod() != "GET" && req.getMethod() != "POST")
+    {
+        // -------------- DEBUG: ------------------
+        logDebug(RED, "[ROUTE] returning 405");
+        // ----------------------------------------
+        res.setErrorPage(405, server.error_pages, server.root);
+        return (res);
+    }
+
+    // 7. Calling CGIHandler if necessary
+    if (target.isCgi)
+    {
+        try
+        {
+            CgiResult result =
+                _cgiHandler->execute(req, target, server.server_name, server.port, "127.0.0.1");
+
+            CgiContext* ctx = new CgiContext();
+
+            ctx->clientFd = req.getClientFd();
+            ctx->writeBuffer = req.getBody();
+            ctx->bytesWritten = 0;
+            ctx->inputFinished = true;
+            ctx->pid = result.pid;
+            ctx->inFd = result.inFd;
+            ctx->outFd = result.outFd;
+            logDebug(GREEN,
+                     "[ROUTE] 1 CGI executed, setting up context and epoll events. Client FD: " +
+                         to_string(ctx->clientFd) + " CGI PID: " + to_string(ctx->pid));
+            logDebug(GREEN, "[ROUTE] 2 CGI inFd: " + to_string(ctx->inFd) +
+                                " outFd: " + to_string(ctx->outFd));
+            this->_cgiFds[result.inFd] = ctx;
+            this->_cgiFds[result.outFd] = ctx;
+
+            if (ctx->writeBuffer.empty())
+            {
+                /* If no body is present:
+                 * Close input pipe to send EOF to CGI process.
+                 * This prevents the CGI from blocking waiting for input.
+                 */
+                closeCgiPipe(ctx, ctx->inFd);
+            }
+            else
+            {
+                /* Register input pipe for writing (POST body streaming) */
+                struct epoll_event evIn;
+                std::memset(&evIn, 0, sizeof(evIn));
+                evIn.events = EPOLLOUT;
+                evIn.data.fd = ctx->inFd;
+                epoll_ctl(this->epollFd, EPOLL_CTL_ADD, ctx->inFd, &evIn);
+                ctx->inputRegistered = true;
+            }
+
+            /* Register output pipe to read CGI response */
+            struct epoll_event ev;
+            std::memset(&ev, 0, sizeof(ev));
+
+            ev.events = EPOLLIN; // Read CGI response
+            ev.data.fd = result.outFd;
+            epoll_ctl(this->epollFd, EPOLL_CTL_ADD, result.outFd, &ev);
+
+            /* Mark response as CGI-driven */
+            res.setIsCgi(true);
+            return (res);
+        }
+        catch (std::exception& e)
+        {
+            res.setErrorPage(405, server.error_pages, server.root);
+            return (res);
+        }
+    }
+    // 7. Relative path for normal handlers
+    //   - Why? We want to keep the logic of “how to handle a GET/POST/DELETE request” inside
+    //   HttpResponse but the logic of “what is the real path of the resource we are trying to
+    //   access” should be outside of it and be decided by the core router
+    std::string relativePath = resolved.fsPath;
+    if (relativePath.empty())
+        relativePath = "/";
+
+    // 8. Dispatch method
+    if (req.getMethod() == "GET" || req.getMethod() == "HEAD")
+        res.handleGet(resolved.fsPath, *loc, server.error_pages, server.root, req.getPath(), resolved.appendIndex);
+    else if (req.getMethod() == "POST")
+        res.handlePost(resolved.fsPath, req.getBody(), *loc, req);
+    else if (req.getMethod() == "DELETE")
+        res.handleDelete(relativePath, *loc);
+    else
+        res.setErrorPage(405, server.error_pages, server.root);
+    return (res);
+}
+
+/* Finalizes CGI response and sends it to client
+ * - Parses raw CGI output into HttpResponse
+ * - Ensures valid HTTP status code
+ * - Stores response in client write buffer
+ * - Switches client to EPOLLOUT
+ * - Cleans up CGI context (without killing process)
+ */
+void Webserv::finalizeCgiResponse(CgiContext* ctx, int fd)
+{
+    (void)fd;
+    HttpResponse res = _cgiHandler->parseCgiOutput(ctx->rawResponse);
+    if (res.getStatusCode() < 100)
+        res.setStatusCode(200);
+
+    if (this->clients.count(ctx->clientFd))
+    {
+        this->clients[ctx->clientFd].writeBuffer = res.toString(false);
+        this->clients[ctx->clientFd].bytesSent = 0;
+
+        // Log CGI response
+        logInfo("CGI -> " + to_string(res.getStatusCode()));
+
+        setClientEpollInterest(ctx->clientFd, EPOLLOUT);
+    }
+
+    destroyCgiContext(ctx, false);
+}
+
+/* Registers CGI stdin (inFd) in epoll for writing
+ * Only if:
+ *  - Context is valid
+ *  - There is pending data to write
+ *  - FD is not already registered
+ */
+void Webserv::registerCgiInputFd(CgiContext* ctx)
+{
+    if (!ctx || ctx->inFd == -1 || ctx->inputRegistered)
+        return;
+
+    if (getCgiPendingBytes(ctx) == 0)
+        return;
+
+    struct epoll_event evIn;
+    std::memset(&evIn, 0, sizeof(evIn));
+    evIn.events = EPOLLOUT;
+    evIn.data.fd = ctx->inFd;
+    int rc = epoll_ctl(this->epollFd, EPOLL_CTL_ADD, ctx->inFd, &evIn);
+    if (rc == 0 || errno == EEXIST)
+    {
+        this->_cgiFds[ctx->inFd] = ctx;
+        ctx->inputRegistered = true;
+    }
+}
+
+/* Synchronizes CGI input pipe state with current buffer
+ * - Closes pipe if all data sent and input finished
+ * - Removes FD from epoll if no data pending
+ * - Registers FD if new data needs to be written
+ */
+void Webserv::syncCgiInputFdState(CgiContext* ctx)
+{
+    if (!ctx || ctx->inFd == -1)
+        return;
+
+    if (getCgiPendingBytes(ctx) == 0 && ctx->inputFinished)
+    {
+        closeCgiPipe(ctx, ctx->inFd);
+    }
+    else if (getCgiPendingBytes(ctx) == 0 && !ctx->inputFinished && ctx->inputRegistered)
+    {
+        epoll_ctl(this->epollFd, EPOLL_CTL_DEL, ctx->inFd, NULL);
+        _cgiFds.erase(ctx->inFd);
+        ctx->inputRegistered = false;
+    }
+    else if (getCgiPendingBytes(ctx) > 0 && !ctx->inputRegistered)
+    {
+        registerCgiInputFd(ctx);
+    }
+}
+
+/* Streams client request body to CGI process
+ *
+ * Supports:
+ *  - Chunked transfer encoding
+ *  - Content-Length bodies
+ *
+ * Chunked mode:
+ *  1. Parses chunks incrementally
+ *  2. Appends decoded data to CGI write buffer
+ *  3. Cleans processed buffer to avoid growth
+ *
+ * Normal mode:
+ *  1. Appends body directly from readBuffer
+ *  2. Tracks total bytes sent
+ *
+ * Finally:
+ *  - Updates backpressure state
+ *  - Syncs CGI input FD with epoll
+ */
+void Webserv::streamClientBodyToCgi(ClientState& client, CgiContext* ctx,
+                                    bool includeBodyFromHeaders, size_t bodyStart)
+{
+    if (!ctx)
+        return;
+
+    if (client.requestIsChunked)
+    {
+        bool chunkComplete = parseChunkedIncremental(client);
+
+        if (client.chunkDecodedBody.size() > client.cgiChunkForwarded)
+        {
+            const size_t forwardedStart = client.cgiChunkForwarded;
+            const size_t delta = client.chunkDecodedBody.size() - forwardedStart;
+            ctx->writeBuffer.append(client.chunkDecodedBody, forwardedStart, delta);
+            client.cgiReceivedBody += delta;
+            registerCgiInputFd(ctx);
+            client.chunkDecodedBody.erase(0, forwardedStart + delta);
+            client.cgiChunkForwarded = 0;
+        }
+
+        if (chunkComplete)
+            ctx->inputFinished = true;
+
+        if (client.chunkParsePos > 65536 && client.chunkParsePos >= client.readBuffer.size() / 2)
+        {
+            client.readBuffer.erase(0, client.chunkParsePos);
+            client.chunkParsePos = 0;
+        }
+        else if (chunkComplete)
+        {
+            client.readBuffer.clear();
+            client.chunkParsePos = 0;
+        }
+    }
+    else
+    {
+        if (includeBodyFromHeaders)
+        {
+            if (client.readBuffer.size() > bodyStart)
+            {
+                const size_t payload = client.readBuffer.size() - bodyStart;
+                ctx->writeBuffer.append(client.readBuffer, bodyStart, payload);
+                client.cgiReceivedBody += payload;
+                registerCgiInputFd(ctx);
+            }
+            client.readBuffer.clear();
+        }
+        else if (!client.readBuffer.empty())
+        {
+            ctx->writeBuffer.append(client.readBuffer);
+            client.cgiReceivedBody += client.readBuffer.size();
+            client.readBuffer.clear();
+            registerCgiInputFd(ctx);
+        }
+
+        if (client.cgiReceivedBody >= client.requestBodyLength)
+            ctx->inputFinished = true;
+    }
+
+    updateCgiBackpressure(client, ctx);
+    syncCgiInputFdState(ctx);
+}
+
+/* Applies backpressure to avoid excessive buffering
+ *  - Pauses client reading if CGI buffer is too large
+ *  - Resumes reading when buffer drops below threshold
+ *
+ * Prevents memory overuse during large uploads
+ */
+void Webserv::updateCgiBackpressure(ClientState& client, CgiContext* ctx)
+{
+    const size_t kCgiBufferHighWatermark = 512 * 1024;
+    const size_t kCgiBufferLowWatermark = 128 * 1024;
+
+    if (!ctx || client.cgiCtx != ctx)
+        return;
+
+    const size_t pending = getCgiPendingBytes(ctx);
+
+    if (!client.cgiReadPaused && pending >= kCgiBufferHighWatermark)
+    {
+        client.cgiReadPaused = true;
+        syncClientEpollInterest(client);
+    }
+    else if (client.cgiReadPaused && pending <= kCgiBufferLowWatermark)
+    {
+        client.cgiReadPaused = false;
+        syncClientEpollInterest(client);
+    }
+}
+
+/* Sets epoll interest for a client FD
+ * Uses EPOLL_CTL_MOD, falls back to ADD if FD not registered
+ */
+void Webserv::setClientEpollInterest(int fd, uint32_t events)
+{
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events = events;
+    ev.data.fd = fd;
+
+    if (epoll_ctl(this->epollFd, EPOLL_CTL_MOD, fd, &ev) < 0 && errno == ENOENT)
+        epoll_ctl(this->epollFd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+/* Synchronizes client epoll state based on current needs
+ *
+ * Determines:
+ *  - Read interest (EPOLLIN)
+ *  - Write interest (EPOLLOUT)
+ *
+ * Removes FD from epoll if no events are needed
+ */
+void Webserv::syncClientEpollInterest(ClientState& client)
+{
+    if (this->clients.find(client.fd) == this->clients.end())
+        return;
+
+    uint32_t events = 0;
+    const bool wantRead = !client.cgiStreaming || !client.cgiReadPaused;
+    const bool wantWrite =
+        !client.writeBuffer.empty() && client.bytesSent < client.writeBuffer.size();
+
+    if (wantRead)
+        events |= EPOLLIN;
+    if (wantWrite)
+        events |= EPOLLOUT;
+
+    if (events == 0)
+    {
+        epoll_ctl(this->epollFd, EPOLL_CTL_DEL, client.fd, NULL);
+        return;
+    }
+
+    setClientEpollInterest(client.fd, events);
+}
+
+/* Handles CGI pipe events:
+ *  - Writes request body to CGI stdin (inFd)
+ *  - Reads CGI output from stdout (outFd)
+ *  - Manages partial writes and reads
+ *  - Finalizes response when CGI finishes execution
+ */
+void Webserv::handleCgiEvent(int fd, uint32_t events)
+{
+    const size_t kCgiProgressStepBytes = 10 * 1024 * 1024;
+
+    if (_cgiFds.find(fd) == _cgiFds.end())
+        return;
+
+    CgiContext* ctx = _cgiFds[fd];
+
+    /* WRITING to CGI (stdin / inFd) */
+    if (fd == ctx->inFd && (events & EPOLLOUT))
+    {
+        const size_t pending = getCgiPendingBytes(ctx);
+        if (pending > 0)
+        {
+            ssize_t n = write(fd, ctx->writeBuffer.data() + ctx->writeOffset, pending);
+
+            if (n > 0)
+            {
+                ctx->bytesWritten += n;
+                ctx->writeOffset += static_cast<size_t>(n);
+
+                if (ctx->bytesWritten >= ctx->progressLogCheckpoint + kCgiProgressStepBytes)
+                {
+                    ctx->progressLogCheckpoint =
+                        (ctx->bytesWritten / kCgiProgressStepBytes) * kCgiProgressStepBytes;
+                }
+
+                if (ctx->writeOffset == ctx->writeBuffer.size())
+                {
+                    ctx->writeBuffer.clear();
+                    ctx->writeOffset = 0;
+                }
+                else if (ctx->writeOffset > 65536 &&
+                         ctx->writeOffset >= ctx->writeBuffer.size() / 2)
+                {
+                    ctx->writeBuffer.erase(0, ctx->writeOffset);
+                    ctx->writeOffset = 0;
+                }
+
+                if (this->clients.count(ctx->clientFd))
+                {
+                    ClientState& client = this->clients[ctx->clientFd];
+                    updateCgiBackpressure(client, ctx);
+                }
+            }
+            else if (n == 0)
+            {
+                // write() returned 0: no bytes written but not an error
+                // The pipe is OK but buffer is full or other transient condition
+                // Just skip and wait for the next epoll event
+            }
+            else if (n < 0)
+            {
+                // write() failed - close the pipe immediately (error handling)
+                closeCgiPipe(ctx, ctx->inFd);
+                if (this->clients.count(ctx->clientFd))
+                {
+                    ClientState& client = this->clients[ctx->clientFd];
+                    updateCgiBackpressure(client, ctx);
+                }
+                return;
+            }
+        }
+
+        syncCgiInputFdState(ctx);
+    }
+
+    /* READING from CGI (stdout / outFd)
+     *
+     * IMPORTANT:
+     * These are independent checks (NOT else-if),
+     * since both events may occur simultaneously  */
+    if (_cgiFds.count(fd) && fd == ctx->outFd && (events & (EPOLLIN | EPOLLHUP | EPOLLERR)))
+    {
+        char buffer[32768];
+        ssize_t n = read(fd, buffer, sizeof(buffer));
+
+        if (n > 0)
+        {
+            ctx->rawResponse.append(buffer, n);
+        }
+        else if (n == 0)
+        {
+            logDebug(GREEN, std::string("[CGI-DONE] Output completo bytes=") +
+                                to_string(ctx->rawResponse.size()));
+            finalizeCgiResponse(ctx, fd);
+        }
+        else if (n < 0)
+        {
+            // read() failed - destroy CGI context immediately (error handling)
+            destroyCgiContext(ctx, true);
+            return;
+        }
+    }
+}
+
+/* Handles client read events:
+ *  - Receives incoming data (non-blocking)
+ *  - Parses HTTP request incrementally
+ *  - Supports:
+ *      • Content-Length bodies
+ *      • Chunked transfer encoding
+ *  - Performs early validation (413, malformed headers)
+ *  - Streams body directly to CGI when required
+ *  - Dispatches fully parsed requests to router
+ */
+void Webserv::handleClientData(int fd, uint32_t events)
+{
+    const size_t kProgressLogStepBytes = 5 * 1024 * 1024;
+
+    if (this->clients.find(fd) == this->clients.end())
+        return;
+    (void)events;
+
+    ClientState& client = this->clients[fd];
+    if (client.cgiStreaming && client.cgiCtx && client.cgiReadPaused)
+        return;
+
+    char buffer[65536];
+    ssize_t bytes = recv(fd, buffer, sizeof(buffer), 0);
+
+    if (bytes < 0)
+    {
+        this->closeConnection(fd);
+        return;
+    }
+    if (bytes == 0)
+    {
+        this->closeConnection(fd);
+        return;
+    }
+
+    client.request.setClientFd(fd);
+    client.readBuffer.append(buffer, bytes);
+
+    if (client.cgiStreaming && client.cgiCtx)
+    {
+        CgiContext* ctx = client.cgiCtx;
+        try
+        {
+            streamClientBodyToCgi(client, ctx, false, 0);
+        }
+        catch (std::exception&)
+        {
+            this->closeConnection(fd);
+            return;
+        }
+
+        size_t streamingMaxBody = client.config.client_max_body_size;
+        if (!client.requestPath.empty())
+        {
+            const Location* streamingLoc = matchLocation(client.config, client.requestPath);
+            if (streamingLoc)
+                streamingMaxBody = streamingLoc->client_max_body_size;
+        }
+
+        if (streamingMaxBody > 0 && client.cgiReceivedBody > streamingMaxBody)
+        {
+            destroyCgiContext(ctx, true);
+
+            HttpResponse res;
+            res.setStatusCode(413);
+            res.setBody("<html><body><h1>413 Payload Too Large</h1></body></html>");
+            res.addHeader("Content-Type", "text/html");
+
+            client.writeBuffer = res.toString(false);
+            client.bytesSent = 0;
+            client.readBuffer.clear();
+            client.headersLogged = false;
+            client.lastBodyLogCheckpoint = 0;
+            client.resetRequestCache();
+
+            logInfo(client.requestMethod + " " +
+                (client.requestPath.empty() ? "/" : client.requestPath) +
+                " -> 413");
+            setClientEpollInterest(fd, EPOLLOUT);
+            return;
+        }
+
+        return;
+    }
+
+    try
+    {
+        // ------------------------------------------------------------
+        // EARLY REJECTION: TEST 200
+        // If headers are already received, check Content-Length
+        // and respond with 413 without waiting for the full body
+        // ------------------------------------------------------------
+        size_t headersEnd = std::string::npos;
+        if (client.requestMetaParsed)
+            headersEnd = client.requestHeadersEnd;
+        else
+            headersEnd = client.readBuffer.find("\r\n\r\n");
+        if (headersEnd != std::string::npos)
+        {
+            size_t bodyStart = headersEnd + 4;
+            size_t bodyAvailable = 0;
+            if (client.readBuffer.size() > bodyStart)
+                bodyAvailable = client.readBuffer.size() - bodyStart;
+
+            if (!client.requestMetaParsed)
+            {
+                // Extract and parse headers only once for this request.
+                std::string headerPart = client.readBuffer.substr(0, headersEnd);
+                std::istringstream stream(headerPart);
+                std::string line;
+
+                // Parse the request line (e.g., "POST /path HTTP/1.1")
+                if (std::getline(stream, line))
+                {
+                    if (!line.empty() && line[line.size() - 1] == '\r')
+                        line.erase(line.size() - 1);
+
+                    std::istringstream iss(line);
+                    iss >> client.requestMethod >> client.requestPath >> client.requestVersion;
+
+                    // Remove query string from the path (everything after '?')
+                    size_t qpos = client.requestPath.find('?');
+                    if (qpos != std::string::npos)
+                    {
+                        client.requestQuery = client.requestPath.substr(qpos + 1);
+                        client.requestPath = client.requestPath.substr(0, qpos);
+                    }
+                    else
+                        client.requestQuery.clear();
+                }
+
+                // Parse all HTTP headers into a map
+                while (std::getline(stream, line))
+                {
+                    if (!line.empty() && line[line.size() - 1] == '\r')
+                        line.erase(line.size() - 1);
+
+                    if (line.empty())
+                        break;
+
+                    size_t colon = line.find(':');
+                    if (colon == std::string::npos)
+                        continue;
+
+                    std::string key = line.substr(0, colon);
+                    std::string value = line.substr(colon + 1);
+
+                    // Trim leading spaces/tabs from header value
+                    while (!value.empty() && (value[0] == ' ' || value[0] == '\t'))
+                        value.erase(0, 1);
+
+                    // Normalize header key to lowercase for case-insensitive lookup
+                    for (size_t i = 0; i < key.size(); ++i)
+                        key[i] = std::tolower(static_cast<unsigned char>(key[i]));
+
+                    client.requestHeaders[key] = value;
+                }
+
+                client.requestHasContentLength = false;
+                client.requestBodyLength = 0;
+                client.requestIsChunked = false;
+
+                std::map<std::string, std::string>::const_iterator teIt =
+                    client.requestHeaders.find("transfer-encoding");
+                if (teIt != client.requestHeaders.end())
+                {
+                    std::string te = teIt->second;
+                    for (size_t i = 0; i < te.size(); ++i)
+                        te[i] = std::tolower(static_cast<unsigned char>(te[i]));
+                    client.requestIsChunked = (te.find("chunked") != std::string::npos);
+                }
+
+                std::map<std::string, std::string>::const_iterator clIt =
+                    client.requestHeaders.find("content-length");
+                if (clIt != client.requestHeaders.end())
+                {
+                    char* endptr = NULL;
+                    unsigned long declaredLen = std::strtoul(clIt->second.c_str(), &endptr, 10);
+                    if (clIt->second.empty() || (endptr && *endptr != '\0'))
+                        throw std::runtime_error("Invalid Content-Length value");
+                    client.requestHasContentLength = true;
+                    client.requestBodyLength = static_cast<size_t>(declaredLen);
+                }
+
+                client.requestMetaParsed = true;
+                client.requestHeadersEnd = headersEnd;
+            }
+
+            const std::string& method = client.requestMethod;
+            const std::string& path = client.requestPath;
+            const std::map<std::string, std::string>& headers = client.requestHeaders;
+
+            if (!client.headersLogged)
+            {
+                std::map<std::string, std::string>::const_iterator clIt =
+                    headers.find("content-length");
+                std::map<std::string, std::string>::const_iterator teIt =
+                    headers.find("transfer-encoding");
+                std::string cl = (clIt != headers.end()) ? clIt->second : "-";
+                std::string te = (teIt != headers.end()) ? teIt->second : "-";
+                if (DEBUG)
+                {
+                    std::string headersMsg = "[HEADERS] FD=" + to_string(fd) + " method=" + method +
+                                             " path=" + path + " content-length=" + cl +
+                                             " transfer-encoding=" + te;
+                    logDebug(BLUE, headersMsg);
+                }
+                client.headersLogged = true;
+            }
+
+            if (bodyAvailable >= client.lastBodyLogCheckpoint + kProgressLogStepBytes)
+            {
+                client.lastBodyLogCheckpoint =
+                    (bodyAvailable / kProgressLogStepBytes) * kProgressLogStepBytes;
+                if (DEBUG)
+                {
+                    std::string bodyProgressMsg = "[BODY-PROGRESS] FD=" + to_string(fd) +
+                                                  " received_body=" + to_string(bodyAvailable) +
+                                                  " bytes";
+                    logDebug(CYAN, bodyProgressMsg);
+                }
+            }
+
+            const Location* loc = NULL;
+            if (!path.empty())
+                loc = matchLocation(client.config, path);
+
+            size_t maxBody = client.config.client_max_body_size;
+            if (loc)
+                maxBody = loc->client_max_body_size;
+
+            // Important: bodyAvailable includes chunk metadata, so this early check
+            // is reliable only for non-chunked bodies
+            if (maxBody > 0 && !client.requestIsChunked && bodyAvailable > maxBody)
+            {
+                if (DEBUG)
+                {
+                    std::string earlyBodyMsg =
+                        "[EARLY] returning 413 body_received=" + to_string(bodyAvailable) +
+                        " limit=" + to_string(maxBody);
+                    logDebug(RED, earlyBodyMsg);
+                }
+                HttpResponse res;
+                res.setStatusCode(413);
+                res.setBody("<html><body><h1>413 Payload Too Large</h1></body></html>");
+                res.addHeader("Content-Type", "text/html");
+
+                client.writeBuffer = res.toString(false);
+                client.bytesSent = 0;
+                client.readBuffer.clear();
+                client.headersLogged = false;
+                client.lastBodyLogCheckpoint = 0;
+                client.resetRequestCache();
+
+                logInfo(client.requestMethod + " " +
+                    (client.requestPath.empty() ? "/" : client.requestPath) +
+                    " -> 413");
+                setClientEpollInterest(fd, EPOLLOUT);
+                return;
+            }
+
+            // If we have a valid path and a Content-Length header, validate it
+            if (!path.empty() && client.requestHasContentLength)
+            {
+                size_t waitingFor = 0;
+                if (client.requestBodyLength > bodyAvailable)
+                    waitingFor = client.requestBodyLength - bodyAvailable;
+                if (DEBUG)
+                {
+                    std::string bodyCheckMsg =
+                        "[BODY-CHECK] path=" + path +
+                        " declared_content-length=" + to_string(client.requestBodyLength) +
+                        " body_available=" + to_string(bodyAvailable) +
+                        " waiting_for=" + to_string(waitingFor) + " bytes";
+                    logDebug(GREEN, bodyCheckMsg);
+                }
+
+                if (loc)
+                {
+                    // Check against configured maximum body size
+                    if (loc->client_max_body_size > 0 &&
+                        client.requestBodyLength > loc->client_max_body_size)
+                    {
+                        if (DEBUG)
+                        {
+                            std::string earlyLenMsg =
+                                std::string("[EARLY] returning 413") +
+                                " declaredLen=" + to_string(client.requestBodyLength) +
+                                " limit=" + to_string(loc->client_max_body_size);
+                            logDebug(RED, earlyLenMsg);
+                        }
+                        // Build 413 Payload Too Large response
+                        HttpResponse res;
+                        res.setStatusCode(413);
+                        res.setBody("<html><body><h1>413 Payload Too Large</h1></body></html>");
+                        res.addHeader("Content-Type", "text/html");
+
+                        // Prepare response for sending
+                        client.writeBuffer = res.toString(false);
+                        client.bytesSent = 0;
+
+                        // Clear read buffer to stop processing request body
+                        client.readBuffer.clear();
+                        client.headersLogged = false;
+                        client.lastBodyLogCheckpoint = 0;
+                        client.resetRequestCache();
+
+                        // Switch epoll to write mode to send the response immediately
+                        setClientEpollInterest(fd, EPOLLOUT);
+
+                        return;
+                    }
+                }
+            }
+
+            if (!client.cgiStreaming && loc && method == "POST" &&
+                (client.requestHasContentLength || client.requestIsChunked))
+            {
+                ResolvedPath resolved = resolvePath(*loc, path);
+                if (isCgiRequest(*loc, resolved.fsPath))
+                {
+                    CgiTarget target = _cgiHandler->detectCgi(*loc, resolved.fsPath);
+                    if (target.isCgi)
+                    {
+                        try
+                        {
+                            client.request.setClientFd(fd);
+                            client.request.setMethod(client.requestMethod);
+                            client.request.setPath(client.requestPath);
+                            client.request.setQuery(client.requestQuery);
+                            client.request.setVersion(client.requestVersion);
+                            client.request.setHeaders(client.requestHeaders);
+                            client.request.setBody("");
+
+                            CgiResult result = _cgiHandler->execute(
+                                client.request, target, client.config.server_name,
+                                client.config.port, "127.0.0.1");
+
+                            CgiContext* ctx = new CgiContext();
+                            ctx->clientFd = fd;
+                            ctx->pid = result.pid;
+                            ctx->inFd = result.inFd;
+                            ctx->outFd = result.outFd;
+                            this->_cgiFds[result.inFd] = ctx;
+                            this->_cgiFds[result.outFd] = ctx;
+
+                            struct epoll_event evOut;
+                            std::memset(&evOut, 0, sizeof(evOut));
+                            evOut.events = EPOLLIN;
+                            evOut.data.fd = result.outFd;
+                            epoll_ctl(this->epollFd, EPOLL_CTL_ADD, result.outFd, &evOut);
+
+                            client.cgiStreaming = true;
+                            client.cgiCtx = ctx;
+                            client.cgiReceivedBody = 0;
+                            client.cgiChunkForwarded = 0;
+                            client.cgiReadPaused = false;
+
+                            streamClientBodyToCgi(client, ctx, true, bodyStart);
+
+                            if (maxBody > 0 && client.cgiReceivedBody > maxBody)
+                            {
+                                destroyCgiContext(ctx, true);
+
+                                HttpResponse res;
+                                res.setStatusCode(413);
+                                res.setBody(
+                                    "<html><body><h1>413 Payload Too Large</h1></body></html>");
+                                res.addHeader("Content-Type", "text/html");
+
+                                client.writeBuffer = res.toString(false);
+                                client.bytesSent = 0;
+                                client.readBuffer.clear();
+                                client.headersLogged = false;
+                                client.lastBodyLogCheckpoint = 0;
+                                client.resetRequestCache();
+
+                                setClientEpollInterest(fd, EPOLLOUT);
+                                return;
+                            }
+
+                            return;
+                        }
+                        catch (std::exception&)
+                        {
+                            HttpResponse res;
+                            res.setStatusCode(500);
+                            res.setBody(
+                                "<html><body><h1>500 Internal Server Error</h1></body></html>");
+                            res.addHeader("Content-Type", "text/html");
+                            client.writeBuffer = res.toString(false);
+                            client.bytesSent = 0;
+                            client.readBuffer.clear();
+                            client.headersLogged = false;
+                            client.lastBodyLogCheckpoint = 0;
+                            client.resetRequestCache();
+
+                            setClientEpollInterest(fd, EPOLLOUT);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            bool requestComplete = true;
+            if (client.requestIsChunked)
+            {
+                requestComplete = parseChunkedIncremental(client);
+
+                if (maxBody > 0 && client.chunkDecodedBody.size() > maxBody)
+                {
+                    HttpResponse res;
+                    res.setStatusCode(413);
+                    res.setBody("<html><body><h1>413 Payload Too Large</h1></body></html>");
+                    res.addHeader("Content-Type", "text/html");
+
+                    client.writeBuffer = res.toString(false);
+                    client.bytesSent = 0;
+                    client.readBuffer.clear();
+                    client.headersLogged = false;
+                    client.lastBodyLogCheckpoint = 0;
+                    client.resetRequestCache();
+
+                    setClientEpollInterest(fd, EPOLLOUT);
+                    return;
+                }
+            }
+
+            if (client.requestHasContentLength)
+            {
+                if (bodyAvailable < client.requestBodyLength)
+                    requestComplete = false;
+            }
+
+            if (!requestComplete)
+                return;
+        }
+        bool requestReady = false;
+        if (client.requestHasContentLength && !client.requestIsChunked)
+        {
+            size_t bodyStart = client.requestHeadersEnd + 4;
+            if (client.readBuffer.size() >= bodyStart + client.requestBodyLength)
+            {
+                client.request.setClientFd(fd);
+                client.request.setMethod(client.requestMethod);
+                client.request.setPath(client.requestPath);
+                client.request.setQuery(client.requestQuery);
+                client.request.setVersion(client.requestVersion);
+                client.request.setHeaders(client.requestHeaders);
+
+                if (bodyStart > 0)
+                    client.readBuffer.erase(0, bodyStart);
+                if (client.readBuffer.size() > client.requestBodyLength)
+                    client.readBuffer.resize(client.requestBodyLength);
+                client.request.swapBody(client.readBuffer);
+                requestReady = true;
+            }
+        }
+        else if (client.requestIsChunked && client.chunkParseComplete)
+        {
+            client.request.setClientFd(fd);
+            client.request.setMethod(client.requestMethod);
+            client.request.setPath(client.requestPath);
+            client.request.setQuery(client.requestQuery);
+            client.request.setVersion(client.requestVersion);
+            client.request.setHeaders(client.requestHeaders);
+            client.request.swapBody(client.chunkDecodedBody);
+            requestReady = true;
+        }
+        else if (client.request.parse(client.readBuffer))
+        {
+            requestReady = true;
+        }
+
+        if (requestReady)
+        {
+            if (DEBUG && (client.request.getMethod() != "GET" || !client.request.getBody().empty()))
+            {
+                logDebug(GREEN, "[REQUEST-START] FD: " + to_string(fd) +
+                                    " Method: " + client.request.getMethod() +
+                                    " Path: " + client.request.getPath() + " Body size: " +
+                                    to_string(client.request.getBody().size()) + " bytes");
+            }
+
+            if (DEBUG)
+            {
+                std::string parseCompleteMsg =
+                    "[DEBUG] REQUEST COMPLETA. Método: " + client.request.getMethod() +
+                    " | Body size: " + to_string(client.request.getBody().size()) + " bytes";
+                logDebug(BLUE, parseCompleteMsg);
+            }
+
+            client.readBuffer.clear();
+            client.headersLogged = false;
+            client.lastBodyLogCheckpoint = 0;
+
+            Config* server = &this->clients[fd].config;
+
+            // Router determines whether this request must be handled as CGI
+            HttpResponse res = routeRequest(client.request, *server);
+
+            if (res.getIsCgi())
+            {
+                if (DEBUG)
+                    logDebug(PURPLE, "[ROUTE] request routed to CGI handler, waiting for CGI "
+                                     "output...handleCgiEvent will take care of the rest.");
+                // For CGI we keep client.request body for async pipe writing,
+                // but raw readBuffer is no longer needed
+                client.readBuffer.clear();
+                client.headersLogged = false;
+                client.lastBodyLogCheckpoint = 0;
+                return;
+            }
+            // -------------- DEBUG: ------------------
+            if (DEBUG)
+            {
+                std::string handleMsg =
+                    "[HANDLE] response status=" + to_string(res.getStatusCode());
+                logDebug(BLUE, handleMsg);
+            }
+            // -----------------------------------------
+            client.writeBuffer = res.toString(client.request.getMethod() == "HEAD");
+            client.bytesSent = 0;
+
+            // Log the response
+            logInfo(client.request.getMethod() + " " + client.request.getPath() + " -> " +
+                    to_string(res.getStatusCode()));
+
+            setClientEpollInterest(fd, EPOLLOUT);
+
+            client.readBuffer.clear();
+            client.headersLogged = false;
+            client.lastBodyLogCheckpoint = 0;
+            client.resetRequestCache();
+        }
+    }
+    catch (std::exception& e)
+    {
+        std::cout << RED << "Error processing request on FD " << fd << ": " << e.what() << RESET
+                  << std::endl;
+        HttpResponse res;
+        res.setStatusCode(400);
+        res.setBody("<html><body><h1>400 Bad Request</h1></body></html>");
+        res.addHeader("Content-Type", "text/html");
+        client.writeBuffer = res.toString(client.request.getMethod() == "HEAD");
+
+        client.bytesSent = 0;
+        client.readBuffer.clear();
+        client.headersLogged = false;
+        client.lastBodyLogCheckpoint = 0;
+        client.resetRequestCache();
+        // Switch to write mode (EPOLLOUT)
+        setClientEpollInterest(fd, EPOLLOUT);
+    }
+}
+
+/**
+ * Handles write events for a client socket:
+ *  - Checks if there is data to send in the client's write buffer
+ *  - Sends as much data as possible to the client
+ *  - If all data is sent, switches back to read mode (EPOLLIN)
+ *  - If an error occurs during send, closes the connection
+ *  - If the response was fully sent, closes the connection (no keep-alive)
+ */
+void Webserv::handleClientWrite(int fd, uint32_t events)
+{
+    (void)events;
+    if (this->clients.find(fd) == this->clients.end())
+        return;
+
+    ClientState& client = this->clients[fd];
+
+    if (client.writeBuffer.empty() || client.bytesSent >= client.writeBuffer.size())
+    {
+        if (DEBUG)
+        {
+            logDebug(GREEN, std::string("[WRITE-COMPLETE] FD ") + to_string(fd) +
+                                ", total bytes sent: " + to_string(client.bytesSent));
+            logDebug(YELLOW, std::string("[DEBUG] No hay más datos que enviar o índice de bytes "
+                                         "enviados supera el tamaño ") +
+                                 "del buffer. FD: " + to_string(fd));
+        }
+        client.bytesSent = 0;
+        client.writeBuffer.clear();
+        setClientEpollInterest(fd, EPOLLIN);
+        return;
+    }
+
+    const char* ptr = client.writeBuffer.data() + client.bytesSent;
+    size_t remaining = client.writeBuffer.size() - client.bytesSent;
+
+    ssize_t sent = send(fd, ptr, remaining, 0);
+
+    if (sent > 0)
+    {
+        client.bytesSent += sent;
+        if (DEBUG)
+        {
+            logDebug(GREEN, std::string("[WRITE] Sent ") + to_string(sent) + " bytes to FD " +
+                                to_string(fd) + ", total sent: " + to_string(client.bytesSent) +
+                                "/" + to_string(client.writeBuffer.size()));
+        }
+    }
+    else if (sent == 0)
+    {
+        // send() returned 0: no bytes sent but not an error
+        // The socket buffer is full or other transient condition
+        // Just skip and wait for the next epoll event
+    }
+    else if (sent < 0)
+    {
+        // send() failed - close connection immediately (error handling)
+        this->closeConnection(fd);
+        return;
+    }
+
+    // FINISH
+    if (client.bytesSent >= client.writeBuffer.size())
+    {
+        if (DEBUG)
+            logDebug(GREEN,
+                     std::string("[SUCCESS] Respuesta enviada completa al FD ") + to_string(fd));
+        client.writeBuffer.clear();
+        client.bytesSent = 0;
+
+        this->closeConnection(fd);
+    }
+}
+
+/* Closes a client connection and cleans up associated resources
+ * - Finds all CGI contexts linked to this client FD
+ * - Avoids duplicating contexts (same ctx can appear twice via inFd/outFd)
+ * - Destroys all related CGI contexts
+ * - Removes FD from epoll
+ * - Erases client state and closes socket
+ */
+void Webserv::closeConnection(int fd)
+{
+    std::vector<CgiContext*> contextsToDestroy;
+
+    std::map<int, CgiContext*>::iterator it = _cgiFds.begin();
+    while (it != _cgiFds.end())
+    {
+        if (it->second->clientFd == fd)
+        {
+            CgiContext* ctx = it->second;
+            bool alreadyQueued = false;
+            for (size_t i = 0; i < contextsToDestroy.size(); ++i)
+            {
+                if (contextsToDestroy[i] == ctx)
+                {
+                    alreadyQueued = true;
+                    break;
+                }
+            }
+            if (!alreadyQueued)
+                contextsToDestroy.push_back(ctx);
+        }
+        ++it;
+    }
+
+    for (size_t i = 0; i < contextsToDestroy.size(); ++i)
+        destroyCgiContext(contextsToDestroy[i], true);
+
+    epoll_ctl(this->epollFd, EPOLL_CTL_DEL, fd, NULL);
+    this->clients.erase(fd);
+    close(fd);
+}
+
+/*
+ * -----------------------------MAIN EVENT LOOP USING EPOLL-----------------------------
+ *  Starts the main server loop using epoll.
+ *
+ *  - Initializes all listening sockets
+ *  - Waits for I/O events on the epoll instance
+ *  - For each triggered fd:
+ *     -> If that fd is a listening socket, accepts new client connections on sockets
+ *     -> Otherwise, client request is processed
+ *  - Handles client activity on connected sockets
+ *
+ *
+ * epoll_wait()
+ *     ↓
+ *  fd event detected
+ *     ↓
+ *  ├── listening fd → acceptNewConnection()
+ *  ├── CGI fd       → handleCgiEvent()
+ *  └── client fd
+ *         ├── EPOLLIN  → handleClientData()
+ *         └── EPOLLOUT → handleClientWrite()
+ *
+ *-----------------------------------------------------------------------*-------------
+ */
+void Webserv::run()
+{
+    setSockets();
+
+    // Ignore SIGPIPE -> avoid crashing when writing to a closed socket
+    signal(SIGPIPE, SIG_IGN);
+    _running = true;
+    signal(SIGINT, Webserv::_handle_signal); // Handle Ctrl+C
+
+    std::cout << GREEN << "Webserv running..." << RESET << std::endl;
+
+    epoll_event epoll_events[100];
+    while (_running)
+    {
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+        {
+        }
+
+        int nfds = epoll_wait(this->epollFd, epoll_events, 100, -1);
+        if (nfds < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error("epoll_wait error");
+        }
+
+        for (int i = 0; i < nfds; i++)
+        {
+            int fd = epoll_events[i].data.fd;
+            uint32_t events = epoll_events[i].events;
+            const bool isCgiFd = (_cgiFds.count(fd) != 0);
+            if (isListeningFd(fd))
+                acceptNewConnection(fd);
+            else if (isCgiFd)
+                handleCgiEvent(fd, events);
+            else
+            {
+                const bool hasRead = (events & EPOLLIN) != 0;
+                const bool hasWrite = (events & EPOLLOUT) != 0;
+                const bool hasHangOrErr = (events & (EPOLLHUP | EPOLLERR)) != 0;
+
+                if (hasRead)
+                    handleClientData(fd, events);
+
+                if (hasWrite && this->clients.count(fd))
+                    handleClientWrite(fd, events);
+
+                if (hasHangOrErr && this->clients.count(fd))
+                {
+                    closeConnection(fd);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+void Webserv::_handle_signal(int signal)
+{
+    (void)signal;
+    Webserv::_running = false;
+}
+
+/* Destructor: Cleans up all resources
+ * - Calls cleanup() to properly shutdown the server
+ * - Prevents resource leaks and zombie processes
+ */
+Webserv::~Webserv() { cleanup(); }
+
+/* Cleanup method: Properly shuts down the server
+ * 1. Kills all active CGI processes
+ * 2. Closes all client connections
+ * 3. Closes all listening sockets
+ * 4. Closes the epoll file descriptor
+ */
+void Webserv::cleanup()
+{
+    std::cout << YELLOW << "[CLEANUP] Starting server shutdown..." << RESET << std::endl;
+
+    // 1. Destroy all CGI contexts (kills processes)
+    std::vector<CgiContext*> cgisToDestroy;
+    for (std::map<int, CgiContext*>::iterator it = _cgiFds.begin(); it != _cgiFds.end(); ++it)
+    {
+        CgiContext* ctx = it->second;
+        bool alreadyQueued = false;
+        for (size_t i = 0; i < cgisToDestroy.size(); ++i)
+        {
+            if (cgisToDestroy[i] == ctx)
+            {
+                alreadyQueued = true;
+                break;
+            }
+        }
+        if (!alreadyQueued)
+            cgisToDestroy.push_back(ctx);
+    }
+
+    for (size_t i = 0; i < cgisToDestroy.size(); ++i)
+    {
+        destroyCgiContext(cgisToDestroy[i], true); // true = kill process
+    }
+
+    std::cout << YELLOW << "[CLEANUP] Destroyed " << cgisToDestroy.size() << " CGI contexts"
+              << RESET << std::endl;
+
+    // 2. Close all client connections
+    std::vector<int> clientFds;
+    for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ++it)
+    {
+        clientFds.push_back(it->first);
+    }
+
+    for (size_t i = 0; i < clientFds.size(); ++i)
+    {
+        epoll_ctl(this->epollFd, EPOLL_CTL_DEL, clientFds[i], NULL);
+        close(clientFds[i]);
+    }
+    clients.clear();
+
+    std::cout << YELLOW << "[CLEANUP] Closed " << clientFds.size() << " client connections" << RESET
+              << std::endl;
+
+    // 3. Close all listening sockets
+    for (size_t i = 0; i < fds.size(); ++i)
+    {
+        epoll_ctl(this->epollFd, EPOLL_CTL_DEL, fds[i], NULL);
+        close(fds[i]);
+    }
+    fds.clear();
+    fdToConfig.clear();
+
+    std::cout << YELLOW << "[CLEANUP] Closed " << fds.size() << " listening sockets" << RESET
+              << std::endl;
+
+    // 4. Close epoll file descriptor
+    if (epollFd >= 0)
+    {
+        close(epollFd);
+        epollFd = -1;
+    }
+
+    std::cout << GREEN << "[CLEANUP] Server shutdown complete" << RESET << std::endl;
+}
