@@ -3,53 +3,181 @@
 #                                                         :::      ::::::::    #
 #    Makefile                                           :+:      :+:    :+:    #
 #                                                     +:+ +:+         +:+      #
-#    By: kpineda- <kpineda-@student.42.fr>          +#+  +:+       +#+         #
+#    By: kpineda- <kpineda-@student.42madrid.com    +#+  +:+       +#+         #
 #                                                 +#+#+#+#+#+   +#+            #
 #    Created: 2024/09/26 23:20:32 by marvin            #+#    #+#              #
-#    Updated: 2024/10/14 23:38:18 by kpineda-         ###   ########.fr        #
+#    Updated: 2026/07/30 16:44:23 by kpineda-         ###   ########.fr        #
 #                                                                              #
 # **************************************************************************** #
 
-LIB = ar rcs 
-NAME = libft.a
+# **************************************************************************** #
+#                                                                              #
+#                                                         :::      ::::::::    #
+#    Makefile                                           :+:      :+:    :+:    #
+#                                                     +:+ +:+         +:+      #
+#    By: user <user@student.42.fr>                    +#+  +:+       +#+       #
+#                                                 +#+#+#+#+#+   +#+            #
+#    Created: 2026/07/30                              #+#    #+#              #
+#    Updated: 2026/07/30                              ###   ########.fr        #
+#                                                                              #
+# **************************************************************************** #
 
-CC = gcc
-CCFLAGS = -Wall -Wextra -Werror
-RM = rm -f
+# **************************************************************************** #
+#                                                                              #
+#                                                         :::      ::::::::    #
+#    Makefile                                           :+:      :+:    :+:    #
+#                                                     +:+ +:+         +:+      #
+#    By: kpineda <kpineda@student.42.fr>              +#+  +:+       +#+       #
+#                                                 +#+#+#+#+#+   +#+            #
+#    Created: 2026/07/30                              #+#    #+#              #
+#    Updated: 2026/07/30                              ###   ########.fr        #
+#                                                                              #
+# **************************************************************************** #
 
-SRC = ft_isalpha.c ft_isdigit.c ft_isalnum.c ft_isascii.c ft_isprint.c\
-ft_strlen.c ft_memset.c ft_bzero.c ft_memcpy.c ft_memmove.c ft_strlcpy.c\
-ft_strlcat.c ft_toupper.c ft_tolower.c ft_strchr.c ft_strrchr.c ft_strncmp.c\
-ft_memchr.c ft_memcmp.c ft_strnstr.c ft_atoi.c ft_calloc.c ft_strdup.c\
-ft_substr.c ft_strjoin.c ft_strtrim.c ft_split.c ft_itoa.c ft_strmapi.c\
-ft_striteri.c ft_putchar_fd.c ft_putstr_fd.c ft_putendl_fd.c ft_putnbr_fd.c\
-ft_calloc.c ft_strdup.c ft_substr.c ft_strjoin.c ft_strtrim.c ft_split.c\
-ft_itoa.c ft_strmapi.c ft_striteri.c ft_putchar_fd.c ft_putstr_fd.c\
-ft_putendl_fd.c ft_putnbr_fd.c
 
-OBJ = $(SRC:%.c=%.o)
-INCLUDE = libft.h
+NAME		= libft.a
 
-BONUSSRC = ft_lstnew_bonus.c ft_lstadd_front_bonus.c ft_lstsize_bonus.c\
-ft_lstlast_bonus.c ft_lstadd_back_bonus.c ft_lstdelone_bonus.c\
-ft_lstclear_bonus.c ft_lstiter_bonus.c ft_lstmap_bonus.c
+CC			= gcc
+CFLAGS		= -Wall -Wextra -Werror
+AR			= ar rcs
+RM			= rm -rf
 
-BONUSOBJ = $(BONUSSRC:%.c=%.o)
+HEADER		= includes/libft.h
 
-all : $(NAME)
 
-$(NAME) : $(OBJ) $(INCLUDE)
-	$(LIB) $(NAME) $(OBJ)
+# Colors
 
-bonus :
-		make SRC="$(SRC) $(BONUSOBJ)"
+GREEN		= \033[0;32m
+BLUE		= \033[0;34m
+CYAN		= \033[0;36m
+YELLOW		= \033[0;33m
+RED			= \033[0;31m
+RESET		= \033[0m
 
-%.o : %.c
-	@$(CC) $(CCFLAGS) -c $< -o $@
+
+
+# **************************************************************************** #
+#                                  SOURCES                                     #
+# **************************************************************************** #
+
+SRC_DIR = src
+
+
+SRC = \
+	$(SRC_DIR)/character/ft_isalnum.c \
+	$(SRC_DIR)/character/ft_isalpha.c \
+	$(SRC_DIR)/character/ft_isascii.c \
+	$(SRC_DIR)/character/ft_isdigit.c \
+	$(SRC_DIR)/character/ft_isprint.c \
+	$(SRC_DIR)/character/ft_tolower.c \
+	$(SRC_DIR)/character/ft_toupper.c \
+	\
+	$(SRC_DIR)/conversion/ft_atoi.c \
+	$(SRC_DIR)/conversion/ft_itoa.c \
+	\
+	$(SRC_DIR)/memory/ft_bzero.c \
+	$(SRC_DIR)/memory/ft_calloc.c \
+	$(SRC_DIR)/memory/ft_memchr.c \
+	$(SRC_DIR)/memory/ft_memcmp.c \
+	$(SRC_DIR)/memory/ft_memcpy.c \
+	$(SRC_DIR)/memory/ft_memmove.c \
+	$(SRC_DIR)/memory/ft_memset.c \
+	\
+	$(SRC_DIR)/output/ft_putchar_fd.c \
+	$(SRC_DIR)/output/ft_putendl_fd.c \
+	$(SRC_DIR)/output/ft_putnbr_fd.c \
+	$(SRC_DIR)/output/ft_putstr_fd.c \
+	\
+	$(SRC_DIR)/string/ft_split.c \
+	$(SRC_DIR)/string/ft_strchr.c \
+	$(SRC_DIR)/string/ft_strdup.c \
+	$(SRC_DIR)/string/ft_striteri.c \
+	$(SRC_DIR)/string/ft_strjoin.c \
+	$(SRC_DIR)/string/ft_strlcat.c \
+	$(SRC_DIR)/string/ft_strlcpy.c \
+	$(SRC_DIR)/string/ft_strlen.c \
+	$(SRC_DIR)/string/ft_strmapi.c \
+	$(SRC_DIR)/string/ft_strncmp.c \
+	$(SRC_DIR)/string/ft_strnstr.c \
+	$(SRC_DIR)/string/ft_strrchr.c \
+	$(SRC_DIR)/string/ft_strtrim.c \
+	$(SRC_DIR)/string/ft_substr.c
+
+
+
+BONUS = \
+	$(SRC_DIR)/linked_list/ft_lstnew_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstadd_front_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstadd_back_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstsize_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstlast_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstdelone_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstclear_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstiter_bonus.c \
+	$(SRC_DIR)/linked_list/ft_lstmap_bonus.c
+
+
+
+OBJ_DIR = obj
+
+OBJ = $(SRC:%.c=$(OBJ_DIR)/%.o)
+
+BONUS_OBJ = $(BONUS:%.c=$(OBJ_DIR)/%.o)
+
+
+
+# **************************************************************************** #
+#                                  RULES                                       #
+# **************************************************************************** #
+
+
+all: title $(NAME)
+
+title:
+	@echo "$(CYAN)"
+	@echo "██╗     ██╗██████╗ ███████╗████████╗"
+	@echo "██║     ██║██╔══██╗██╔════╝╚══██╔══╝"
+	@echo "██║     ██║██████╔╝█████╗     ██║"
+	@echo "██║     ██║██╔══██╗██╔══╝     ██║"
+	@echo "███████╗██║██████╔╝██║        ██║"
+	@echo "╚══════╝╚═╝╚═════╝ ╚═╝        ╚═╝"
+	@echo "$(RESET)"
+
+
+$(NAME): $(OBJ)
+	@echo "$(BLUE)Creating $(NAME)...$(RESET)"
+	@$(AR) $(NAME) $(OBJ)
+	@echo "$(GREEN)✓ Library created successfully$(RESET)"
+
+
+bonus: $(OBJ) $(BONUS_OBJ)
+	@echo "$(BLUE)Adding bonus...$(RESET)"
+	@$(AR) $(NAME) $(BONUS_OBJ)
+	@echo "$(GREEN)✓ Bonus completed$(RESET)"
+
+
+$(OBJ_DIR)/%.o: %.c $(HEADER)
+	@mkdir -p $(dir $@)
+	@echo "$(YELLOW)Compiling $<$(RESET)"
+	@$(CC) $(CFLAGS) -Iincludes -c $< -o $@
+
+
 clean:
-	@$(RM) $(OBJ) $(BONUSOBJ)
-fclean: clean
-	$(RM) $(NAME)
-re: fclean all bonus
+	@echo "$(RED)Cleaning objects...$(RESET)"
+	@$(RM) $(OBJ_DIR)
 
-.PHONY: all bonus clean fclean re
+
+fclean: clean
+	@echo "$(RED)Removing library...$(RESET)"
+	@$(RM) $(NAME)
+
+
+re: fclean all
+
+
+norm:
+	@norminette $(SRC) $(BONUS) $(HEADER)
+
+
+
+.PHONY: all bonus clean fclean re norm title
